@@ -116,16 +116,32 @@ float currU = 0.0f, currV = 0.0f, currW = 0.0f;
  */
 uint32_t adcResult[NUM_ADC_CHN];
 
-/* 【新增调试量】 */
+/* 
+ * 调试量
+ * 前三项均在 config.h 中定义，用户可修改
+ * 后面三个是测量/估算结果，供调试观察用
+ */
+
 volatile float speedReferenceRpm = SPEED_REF_RPM;
 volatile float idReferenceA = ID_REF_A;
 volatile float iqReferenceA = IQ_REF_A;
+
+/*
+ * 定义测量到的机械转速、电角速度、电角度
+ * 来自无感观测器的输出
+ */  
 volatile float measuredMechanicalSpeedRpm = 0.0f;
 volatile float measuredElectricalSpeedRad = 0.0f;
 volatile float estimatedElectricalAngle = 0.0f;
 
-/* 【新增内部调度变量】 */
+
+//速度环降采样计数器用于实现速度环降采样，速度环不需要在每个电流环周期都执行
 static uint32_t speedLoopDividerCounter = 0U;
+
+/* 定义来自速度环的q轴电流参考值
+ * 初始值来自config.h
+ * 当速度环有效时，此变量由速度环输出更新
+ */
 static float iqReferenceFromSpeedLoop = IQ_REF_A;
 
 /* Private function prototypes -----------------------------------------------*/
@@ -169,49 +185,85 @@ static float AdcCountsToCurrent(uint32_t sample, float offset, float scale)
 
 /*
  * 函数作用：
- * 对当前工程使用的所有 FOC 控制对象做运行前初始化。
+ * 对当前工程使用的所有 FOC 控制对象做运行前初始化
  *
  * 形参含义与来源：
- * 无显式形参。
- * 本函数直接读取 config.h 中的控制参数、观测器参数、PWM 参数以及调试给定变量，
- * 并写入全局控制对象：smo、sensorless、idController、iqController、speedController、svm。
+ * 无显式形参
+ * 函数直接读取 config.h 中的控制参数、观测器参数、PWM 参数以及调试给定变量
+ * 并写入全局控制对象：smo、sensorless、idController、iqController、speedController、svm
  *
  * 输出与去向：
  * 没有返回值。
  * 它的输出体现在各个全局控制对象内部状态被初始化，
- * 后续 HAL_ADC_ConvCpltCallback() 会直接消费这些初始化结果。
+ * 后续 HAL_ADC_ConvCpltCallback() 会直接消费这些初始化结果
  */
 /*
  * 中间变量说明：
- * - speed_loop_ts : 由 CURRENT_LOOP_TS 和 SPEED_LOOP_DIVIDER 相乘得到的速度环实际执行周期，
+ * speed_loop_ts : 由 CURRENT_LOOP_TS 和 SPEED_LOOP_DIVIDER 相乘得到的速度环实际执行周期，
  *                   只用于本函数里写给 speedController.Ts。
- * - 其余像 sensorless.emfAlphaFilter.alpha、sensorless.speedFilter.alpha 等值，
- *   都直接来自 FOC_LPFAlphaFromCutoff() 的返回值；PI/PLL 参数则直接来自 config.h 宏。
+ * 其余像 sensorless.emfAlphaFilter.alpha、sensorless.speedFilter.alpha 等值
+ * 都直接来自 FOC_LPFAlphaFromCutoff() 的返回值；PI/PLL 参数则直接来自 config.h 宏
  */
 static void FOC_ControlInit(void)
 {
+
   float speed_loop_ts;
 
+  //速度环采样周期 = 电流环采样周期 × 速度环分频系数
+  //例如：电流环10kHz，速度环分频系数10，则速度环为1kHz
   speed_loop_ts = CURRENT_LOOP_TS * (float)SPEED_LOOP_DIVIDER;
 
-  /* SMO 参数 */
+  /* SMO参数
+   * 初始化SMO滑模观测器参数
+   */
+
+   /* 
+    * 滑模增益系数k
+    * 平滑系数（tanh函数斜率）a 
+    * 电机参数Rs（定子电阻）、Ls（定子电感） 
+    * SMO更新周期Ts（电流环采样周期）
+    */
   smo.k = SMO_K;
   smo.a = SMO_A;
   smo.Rs = SMO_RS;
   smo.Ls = SMO_LS;
   smo.Ts = CURRENT_LOOP_TS;
 
-  /* EMF 后处理链 */
+  /* 
+   * 初始化无感观测器基本参数
+   * 参数来自config.h
+   */
+
+  //电机极对数
   sensorless.polePairs = MOTOR_POLE_PAIRS;
+  //EMF低通滤波截止频率
   sensorless.emfFilterCutoffHz = EMF_LPF_CUTOFF_HZ;
+  //EMF最低有效阈值
   sensorless.minEmfMagnitude = EMF_MIN_MAGNITUDE;
+
+  /*
+   * 根据截止频率和采样周期计算低通滤波的 alpha 参数
+   * Alpha轴、Beta轴、速度低通滤波
+   */
   sensorless.emfAlphaFilter.alpha = FOC_LPFAlphaFromCutoff(EMF_LPF_CUTOFF_HZ, CURRENT_LOOP_TS);
   sensorless.emfBetaFilter.alpha = FOC_LPFAlphaFromCutoff(EMF_LPF_CUTOFF_HZ, CURRENT_LOOP_TS);
   sensorless.speedFilter.alpha = FOC_LPFAlphaFromCutoff(SPEED_EST_LPF_CUTOFF_HZ, CURRENT_LOOP_TS);
+
+  /*
+   * 初始化PLL锁相环参数
+   * 参数来自config.h
+   * 比例增益 kp
+   * 积分增益 ki
+   * 抗积分饱和增益 kc
+   * 采样周期 Ts
+   * 速度限幅
+   * 积分项限幅
+   */
   sensorless.pll.kp = PLL_KP;
   sensorless.pll.ki = PLL_KI;
   sensorless.pll.kc = PLL_KC;
   sensorless.pll.Ts = CURRENT_LOOP_TS;
+
   sensorless.pll.speedMin = -PLL_SPEED_MAX_RAD_PER_SEC;
   sensorless.pll.speedMax = PLL_SPEED_MAX_RAD_PER_SEC;
   sensorless.pll.integralMin = PLL_INTEGRAL_MIN;
@@ -224,7 +276,9 @@ static void FOC_ControlInit(void)
   idController.outMax = ID_MAX;
   idController.outMin = ID_MIN;
   idController.Ts = CURRENT_LOOP_TS;
+  //初始参考值
   idController.reference = idReferenceA;
+  //调用PI_Reset清零积分项和输出
   PI_Reset(&idController);
 
   /* q 轴电流环 */
@@ -247,11 +301,21 @@ static void FOC_ControlInit(void)
   speedController.reference = FOC_RpmToRadPerSec(speedReferenceRpm);
   PI_Reset(&speedController);
 
-  /* SVM */
+  /* 
+   * 初始化SVM空间矢量调制参数
+   * 参数来自config.h
+   * 最大调制度 maxMa
+   * 母线电压 VDC
+   * 定时器自动重装值 timerARR
+   */
   svm.maxMa = SVM_MAX_MA;
   svm.VDC = BUS_VOLTAGE_NOMINAL_V;
   svm.timerARR = SVM_TIMER_ARR;
 
+  /*
+   * 重置速度环分频计数器
+   * 设置初始q轴电流参考值为iqReferenceA
+  */
   speedLoopDividerCounter = 0U;
   iqReferenceFromSpeedLoop = iqReferenceA;
 }
@@ -259,20 +323,13 @@ static void FOC_ControlInit(void)
 /*
  * 函数作用：
  * 把三相 PWM 占空比统一设置到安全中心值。
- *
- * 形参含义与来源：
- * 无显式形参。
+
  * 本函数使用 svm.timerARR 作为定时器周期基准。
  *
  * 输出与去向：
  * svm.dutyA / dutyB / dutyC 会被设置为 ARR 的一半，
  * 并立即通过 __HAL_TIM_SetCompare() 写入 TIM1 三个比较寄存器。
  * 这样系统上电后会先处于中点占空比状态，避免一开始就输出极端占空比。
- */
-/*
- * 中间变量说明：
- * - 本函数没有单独定义局部中间变量。
- * - 三个占空比直接由 svm.timerARR 推导得到，属于“安全上电占空比”的一次性中转结果。
  */
 static void FOC_SetPwmToSafeCenter(void)
 {
@@ -286,28 +343,14 @@ static void FOC_SetPwmToSafeCenter(void)
 }
 /* USER CODE END 0 */
 
-/**
-  * @brief  The application entry point.
-  * @retval int
-  */
+
 /*
- * 函数作用：
  * 应用程序主入口，负责完成 MCU、外设和 FOC 控制对象的整体初始化。
  *
- * 形参含义与来源：
- * 无显式输入参数。
- * 该函数内部依次调用 HAL 初始化、时钟配置、GPIO/DMA/ADC/TIM/UART 初始化，
- * 并调用 FOC_ControlInit() 与 FOC_SetPwmToSafeCenter() 完成算法层准备。
+ * 该函数内部依次调用 HAL 初始化、时钟配置、GPIO/DMA/ADC/TIM/UART 初始化
+ * 并调用 FOC_ControlInit() 与 FOC_SetPwmToSafeCenter() 完成算法层准备
  *
- * 输出与去向：
- * 无返回意义上的业务输出。
  * 它最终启动 TIM1 PWM 与 ADC DMA，让后续实时控制流程转移到 HAL_ADC_ConvCpltCallback() 中执行。
- */
-/*
- * 中间变量说明：
- * - 本函数没有单独定义局部中间变量。
- * - 它的主要“中转结果”都体现在被依次调用的初始化函数输出里，例如
- *   FOC_ControlInit() 初始化出的控制对象状态，以及 FOC_SetPwmToSafeCenter() 写入的初始占空比。
  */
 int main(void)
 {
@@ -341,12 +384,13 @@ int main(void)
   /* USER CODE BEGIN 2 */
   FOC_ControlInit();
   FOC_SetPwmToSafeCenter();
-	//**********************************************************	
+
+
 	/* 启动三相逆变器的互补 PWM 输出。
 	 *
 	 * TIM1 是高级定时器，每一相都可以输出：
-	 * - 主 PWM 通道：通常驱动上桥臂
-	 * - 互补 PWM 通道：通常驱动下桥臂
+	 * 主 PWM 通道：通常驱动上桥臂
+	 * 互补 PWM 通道：通常驱动下桥臂
 	 *
 	 * 三相逆变器一共需要 6 路驱动信号：
 	 * UH/UL、VH/VL、WH/WL。
@@ -376,8 +420,8 @@ int main(void)
 	/* 给各个算法结构体写入真实参数。
 	 *
 	 * *_DEFAULT 宏的作用主要是：
-	 * - 把变量先初始化为 0
-	 * - 把函数指针绑定好
+	 * 把变量先初始化为 0
+	 * 把函数指针绑定好
 	 *
 	 * 但真正要运行时，还必须把控制参数、观测器参数、PWM 参数写进去。
 	 */
@@ -452,9 +496,8 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
 	
 	if(hadc->Instance == ADC1)
 	{
-		/* =====================================================================
+		/* 
 		 * 这个回调函数就是本例程真正的 FOC 主流程。
-		 * =====================================================================
 		 * 每当 ADC1 完成一次转换序列时，会依次执行：
 		 *
 		 * 1. 从 DMA 缓冲区取出三相电流
@@ -468,11 +511,10 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
 		 * 9. 把新的占空比写入定时器比较寄存器
 		 *
 		 * 一句话概括：
-		 * 采样电流 -> 坐标变换 -> 控制计算 -> 更新 PWM
-		 * =====================================================================
+		 * 采样电流 -> 坐标变换 -> 控制计算 -> 更新 PWM 占空比
 		 */
 		
-		/* 取出三相原始 ADC 结果。
+		/* 取出三相原始 ADC 结果
 		 *
 		 * 严格来说，在真实工程里，这些原始值通常还需要：
 		 * - 去零偏
@@ -500,6 +542,7 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
 		 */
 		clarke.ia = currU;
     clarke.ib = currV;
+
     clarke.clarke_fcn_ptr(&clarke);
 
 		/* 给 SMO 观测器准备输入。
@@ -513,49 +556,78 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
 		 */
     smo.iAlpha = clarke.iAlpha;
     smo.iBeta  = clarke.iBeta;
+    
     smo.vAlpha = svm.vAlpha;
 		smo.vBeta = svm.vBeta;
+
     smo.smo_fcn_ptr(&smo);
 
-		/* 估算 */
+		/* 无感观测器更新 */
 		sensorless.rawEAlpha = smo.eAlpha;
 		sensorless.rawEBeta = smo.eBeta;
 		sensorless.observer_fcn_ptr(&sensorless);
-
+    //无感观测器输出的转速、电角速度和电角度
 		measuredMechanicalSpeedRpm = sensorless.speedRpm;
 		measuredElectricalSpeedRad = sensorless.omegaElectrical;
 		estimatedElectricalAngle = sensorless.thetaElectrical;
 
-		/* 【新增速度环】 */
+		/* 速度环控制 */
 		if (SPEED_LOOP_ENABLE != 0U)
 		{
+      /* 
+       * 降采样实现
+       * 速度环不需要在每个电流环周期都执行，通常降采样执行
+       */
+
+      /*
+       * 如果速度环启用
+       * 速度环降采样计数器递增 
+       */
 			speedLoopDividerCounter++;
+
+      /* 速度环执行周期判断
+       * 如果达到执行周期就执行一次速度控制
+       */
+
 			if (speedLoopDividerCounter >= SPEED_LOOP_DIVIDER)
 			{
+        //重置计数器为0
 				speedLoopDividerCounter = 0U;
+        //将转速从RPM转为角速度rad/s 作为速度环的参考输入PI控制器的参考输入
 				speedController.reference = FOC_RpmToRadPerSec(speedReferenceRpm);
+        //将无感观测器估算的机械角速度作为速度环反馈输入
 				speedController.input = sensorless.omegaMechanical;
 
+
+        //若是无感观测器有效
 				if (sensorless.valid != 0U)
 				{
+          //执行速度PI控制
 					speedController.pi_fcn_ptr(&speedController);
+          //把速度PI控制器的输出作为 q 轴电流参考值，传给 iqReferenceFromSpeedLoop
 					iqReferenceFromSpeedLoop = speedController.controllerOut;
 				}
 				else
+        //无效时
 				{
 					PI_Reset(&speedController);
+          //使用保底的q轴电流参考值
 					iqReferenceFromSpeedLoop = ESTIMATOR_INVALID_IQ_REF_A;
 				}
 			}
 
 			iq_ref_cmd = iqReferenceFromSpeedLoop;
 		}
+
+    //若速度环未启用
 		else
 		{
 			iq_ref_cmd = iqReferenceA;
 		}
 
 		id_ref_cmd = idReferenceA;
+
+    /* 对 d/q 电流做矢量总幅值限制 */
 		FOC_LimitCurrentDQ(&id_ref_cmd, &iq_ref_cmd, CURRENT_VECTOR_LIMIT_A);
 
 		/* 用观测器估算出来的 theta 做 Park 变换，
@@ -566,16 +638,16 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
 		park.theta = sensorless.thetaElectrical;
 		park.park_fcn_ptr(&park);
 		
-		/* d 轴电流 PI 控制。
-		 * 在很多基础 PMSM 控制里，当不做弱磁控制时，
-		 * 常见目标是 i_d_ref = 0。
+		/* d 轴电流 PI 控制
+		 * 在很多基础 PMSM 控制里，当不做弱磁控制时
+		 * 常见目标是 i_d_ref = 0
 		 */
 		idController.reference = id_ref_cmd;
 		idController.input = park.iD;
 		idController.pi_fcn_ptr(&idController);
 		
-		/* q 轴电流 PI 控制。
-		 * q 轴通常是主要产生产生电磁转矩的控制轴。
+		/* q 轴电流 PI 控制
+		 * q 轴通常是主要产生产生电磁转矩的控制轴
 		 */
 		iqController.reference = iq_ref_cmd;
 		iqController.input = park.iQ;
@@ -594,8 +666,6 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
 		 * 有些工程会直接写成：
 		 *   vD = PI输出
 		 *   vQ = PI输出
-		 *
-		 * 你学习时一定要尊重代码本身，不要只看理论图就默认它一定是某种写法。
 		 */
 		vd_cmd = idController.controllerOut;
 		vq_cmd = iqController.controllerOut;

@@ -274,7 +274,7 @@ void Sensorless_Observer_Update(SENSORLESS_OBSERVER_TYPEDEF *observer)
     //速度滤波器的输出作为最终机械角速度
     observer->omegaMechanical = observer->speedFilter.filterOut;
 
-    /* 11.把机械角速度转换成 rpm，便于调试和显示 */
+    /* 11.把机械角速度转换成 rpm */
     observer->speedRpm = FOC_RadPerSecToRpm(observer->omegaMechanical);
 }
 
